@@ -1,89 +1,161 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import {
+	App,
+	Editor,
+	MarkdownView,
+	Notice,
+	Plugin,
+	PluginSettingTab,
+	Setting,
+} from "obsidian";
 
-// Remember to rename these classes and interfaces!
+import { YoutubeLoader } from "./loaders/youtubeLoader";
+import { OpenAI } from "langchain/llms";
+import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
+import { loadSummarizationChain } from "langchain/chains";
+import { ArticleLoader } from "./loaders/articleLoader";
 
-interface MyPluginSettings {
-	mySetting: string;
+interface ObsidianSummarizerSettings {
+	openAIApiKey: string;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+const DEFAULT_SETTINGS: ObsidianSummarizerSettings = {
+	openAIApiKey: "",
+};
+
+function extractYouTubeVideoId(url: string): string | null {
+	const pattern =
+		/^(?:https?:\/\/)?(?:www\.)?(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))((\w|-){11})(?:\S+)?$/;
+	const match = url.match(pattern);
+
+	if (match) {
+		return match[1];
+	} else {
+		return null;
+	}
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class ObsidianSummarizer extends Plugin {
+	settings: ObsidianSummarizerSettings;
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+		const settings = this.settings;
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
+		this.addCommand({
+			id: "summarize-webpage",
+			name: "Summarize webpage",
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+			async editorCallback(editor: Editor, view: MarkdownView) {
+				const settingFilled = settings.openAIApiKey.trim() !== "";
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
+				if (!settingFilled) {
+					return new Notice("Please fill in your Open AI API Key");
 				}
-			}
+
+				const loader = new ArticleLoader(editor.getSelection().trim());
+
+				const splitter = new RecursiveCharacterTextSplitter({
+					chunkSize: 2000,
+					chunkOverlap: 0,
+				});
+
+				const docs = await loader.loadAndSplit(splitter);
+
+				console.log(docs);
+
+				const llm = new OpenAI({
+					temperature: 0,
+					openAIApiKey: settings.openAIApiKey,
+				});
+
+				const chain = await loadSummarizationChain(llm, {
+					type: "map_reduce",
+				});
+
+				const result = await chain.call({
+					input_documents: docs,
+				});
+
+				const trimmedText = result.text.trim();
+
+				console.log(trimmedText);
+
+				const cursor = editor.getCursor();
+				cursor.line++;
+				cursor.ch = 0;
+
+				editor.replaceRange(trimmedText, cursor);
+
+				cursor.ch = trimmedText.length;
+				editor.setCursor(cursor);
+			},
 		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+		this.addCommand({
+			id: "summarize-youtube-video",
+			name: "Summarize YouTube video",
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
+			async editorCallback(editor: Editor, view: MarkdownView) {
+				const settingFilled = settings.openAIApiKey.trim() !== "";
+
+				if (!settingFilled) {
+					return new Notice("Please fill in your Open AI API Key");
+				}
+
+				const videoId = extractYouTubeVideoId(editor.getSelection());
+
+				if (!videoId) {
+					return new Notice("Please select a YouTube video URL");
+				}
+
+				const loader = new YoutubeLoader(videoId, false, "en");
+				let transcript;
+
+				try {
+					transcript = await loader.load();
+				} catch (err) {
+					return new Notice("Error loading video");
+				}
+
+				const llm = new OpenAI({
+					temperature: 0,
+					openAIApiKey: settings.openAIApiKey,
+				});
+
+				const chain = await loadSummarizationChain(llm, {
+					type: "stuff",
+				});
+
+				const result = await chain.call({
+					input_documents: transcript,
+				});
+
+				const trimmedText = result.text.trim();
+
+				const cursor = editor.getCursor();
+				cursor.line++;
+				cursor.ch = 0;
+
+				editor.replaceRange(trimmedText, cursor);
+
+				cursor.ch = trimmedText.length;
+				editor.setCursor(cursor);
+			},
 		});
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+		this.addSettingTab(new SummarizerSettingTab(this.app, this));
 	}
 
-	onunload() {
-
-	}
+	onunload() {}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		console.log("load settings");
+		this.settings = Object.assign(
+			{},
+			DEFAULT_SETTINGS,
+			await this.loadData()
+		);
 	}
 
 	async saveSettings() {
@@ -91,47 +163,30 @@ export default class MyPlugin extends Plugin {
 	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+class SummarizerSettingTab extends PluginSettingTab {
+	plugin: ObsidianSummarizer;
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
-
-	constructor(app: App, plugin: MyPlugin) {
+	constructor(app: App, plugin: ObsidianSummarizer) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
 
 	display(): void {
-		const {containerEl} = this;
+		const { containerEl } = this;
 
 		containerEl.empty();
 
-		containerEl.createEl('h2', {text: 'Settings for my awesome plugin.'});
-
 		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					console.log('Secret: ' + value);
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
+			.setName("Open AI API Key")
+			.setDesc("For the magic")
+			.addText((text) =>
+				text
+					.setPlaceholder("sk-1234")
+					.setValue(this.plugin.settings.openAIApiKey)
+					.onChange(async (value) => {
+						this.plugin.settings.openAIApiKey = value;
+						await this.plugin.saveSettings();
+					})
+			);
 	}
 }
